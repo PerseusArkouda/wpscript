@@ -1,0 +1,188 @@
+#!/bin/bash
+# by Perseus
+# wp cli program for deleting duplicated Wordpress pending posts and then publishing them
+# NOTICE: Take a database backup of your Wordpress before you use it!!!
+# To automate enable silent mode and put in crontab like that (every 6 hours): * */6 * * * /path/to/wp-script --commit >/dev/null 2>/path/to/wp-script-errors.log
+#  When running automated and if you have a lot of pending posts, set it in longer time intervals in crontab to avoid being executed multiple times and cause unexpected results
+# Parameter explanation:
+#  --show     Shows the pending posts and the duplicated pending posts (if they exist)
+#  --commit   Deletes duplicated pending posts, replaces specified strings (optional) and publishes them in time intervals
+#  --delpub   Deletes duplicated published posts
+
+
+# --- EDIT BELOW ---
+# Set the path of wp cli program
+wp_path="/usr/local/bin/wp"
+# Set the path of a wordpress site
+wordpress_path="/path/to/wordpress"
+# Simulation mode. Pretends it deletes duplicates, publishes or search and replacing (if enabled). Switch to true to actually perform the tasks.
+simulate=true
+# Set the interval time in minutes for publishing between posts to avoid spam
+publish_time=30
+# Set if you want the interval time to be fixed or with a random value from 1 to $publish_time
+random_time=true
+# Set if you want to automate without asking for confirmation before publishing
+silent=false
+
+# Advanced Settings
+# Search and Replace functionality. It will replace strings from wp_posts, wp_postmeta and wp_terms tables
+# Enable it if you want and edit/add search and replace strings.
+search_replace=false
+declare -A replace
+# You can add as many strings you wish to search and replace in the array below with the following format:
+# array  search  replace
+replace["&apos;"]="'"
+replace["&amp;"]="&"
+
+
+# --- DO NOT EDIT BELOW ---
+
+# Error handling
+[ -z "$(command -v $wp_path)" ] && echo "Error. wp path not found or not an executable program." && exit 1
+[ ! -d "$wordpress_path" ] && echo "Error. Wordpress path not found." && exit 1
+[ "$random_time" = true ] && [ -z "$(which shuf)" ] && echo "Error. shuf program not found and is required for random time. Set random_time to false or install shuf and retry." && exit 1
+[ -z "$1" ] && echo "Required parameter: --show or --commit or --delpub." && exit 1
+
+# Activating simulation mode
+[ "$simulate" = true ] && echo "Running in Simulation mode." && dry="--dry-run"
+
+# Function that shows pending duplicated posts
+check_dupes() {
+ status="$1"
+ if [ "$status" != "pending" ] && [ "$status" != "publish" ]; then
+  echo "Error. status variable is not defined correctly. Exiting." && exit 1
+ fi
+ "$wp_path" --path="$wordpress_path" db query "
+  SELECT a.ID, a.post_title, a.post_type, a.post_status
+   FROM wp_posts AS a
+     INNER JOIN (
+        SELECT post_title, MIN( id ) AS min_id
+        FROM wp_posts
+        WHERE post_type = 'post'
+        AND post_status = '$status'
+        GROUP BY post_title
+        HAVING COUNT( * ) > 1
+     ) AS b ON b.post_title = a.post_title
+   AND b.min_id <> a.id
+   AND a.post_type = 'post'
+   AND a.post_status = '$status'
+ "
+ [ "$?" != "0" ] && echo "Error. wp returned an unknown error. Exiting immediately." && exit 1
+}
+
+# Function that deletes pending duplicated posts
+delete_dupes() {
+ status="$1"
+ if [ "$status" != "pending" ] && [ "$status" != "publish" ]; then
+  echo "Error. status variable is not defined correctly. Exiting." && exit 1
+ fi
+ "$wp_path" --path="$wordpress_path" db query "
+  DELETE a.*
+   FROM wp_posts AS a
+     INNER JOIN (
+        SELECT post_title, MIN( id ) AS min_id
+        FROM wp_posts
+        WHERE post_type = 'post'
+        AND post_status = '$status'
+        GROUP BY post_title
+        HAVING COUNT( * ) > 1
+     ) AS b ON b.post_title = a.post_title
+   AND b.min_id <> a.id
+   AND a.post_type = 'post'
+   AND a.post_status = '$status'
+ "
+ [ "$?" != "0" ] && echo "Error. wp returned an unknown error. Exiting immediately." && exit 1
+}
+
+# Function that lists pending posts
+list_pending() {
+ "$wp_path" --path="$wordpress_path" post list --post_status=pending --post_type=post
+ [ "$?" != "0" ] && echo "Error. wp returned an unknown error. Exiting immediately." && exit 1
+}
+
+# Function that publishes pending posts. This function also calls delete_dupes()
+publish_pending() {
+ post_ids=( $("$wp_path" --path="$wordpress_path" post list --post_status=pending --post_type=post --format=ids) )
+ count=0
+ for post_id in "${post_ids[@]}"; do
+  let count=count+1
+  if [ $count -ne 1 ]; then
+   if [ "$random_time" = true ]; then
+     timer=$(shuf -i1-${publish_time} -n1)
+     echo "Will publish the next post in $timer minutes..."
+     sleep ${timer}m
+   else
+     sleep ${publish_time}m
+   fi
+  fi
+  dupes=$(check_dupes pending)
+  if [ -z "$dupes" ]; then
+   echo "No duplicates found. Skipping duplicated pending posts deletion."
+  else
+   if [ "$silent" != true ]; then
+    read -rp "Are you sure you want to delete the duplicated pending posts? (y/n):" "delpen"
+    [ "$delpen" != "y" ] && echo "Aborting deletion of the duplicated pending posts. Exiting." && exit 0 || echo "Duplicates found. Deleting duplicated pending posts..."
+   fi
+   [ "$simulate" = true ] && echo "Duplication deletion skipped because of simulation mode." || delete_dupes pending
+   echo "Done."
+  fi
+  [ "$simulate" = true ] && echo "Publishing pending posts skipped because of simulation mode." || "$wp_path" --path="$wordpress_path" post update $post_id --post_status=publish
+  [ "$?" != "0" ] && echo "Error. wp returned an unknown error. Exiting immediately." && exit 1
+ done
+}
+
+# Function to search and replace strings
+search_and_replace() {
+ for i in "${!replace[@]}"; do
+  echo "Searching for: $i and replacing with: ${replace[$i]}..."
+  "$wp_path" --path="$wordpress_path" search-replace "$i" "${replace[$i]}" wp_posts wp_postmeta wp_terms $dry
+  [ "$?" != "0" ] && echo "Error. wp returned an unknown error. Exiting immediately." && exit 1
+ done
+ echo "Done."
+}
+
+
+# Get the parameter and execute the appropriate task
+show=$(grep "^\-\-show" <<<"$1")
+commit=$(grep "^\-\-commit" <<<"$1")
+delpub=$(grep "^\-\-delpub" <<<"$1")
+
+if [ ! -z "$show" ]; then
+ echo "Showing pending posts:" && list_pending
+ dupes=$(check_dupes pending)
+ if [ -z "$dupes" ]; then
+  echo "No duplicated pending posts found. Ok!"
+ else
+  echo "Showing duplicated pending posts:" && check_dupes pending
+  echo "Done."
+ fi
+elif [ ! -z "$commit" ]; then
+ echo "Checking for pending posts..."
+ pending=$(list_pending)
+ if [ -z "$pending" ]; then
+  echo "No pending posts. Nothing to commit." && exit 0
+ fi
+ [ "$search_replace" = true ] && search_and_replace
+ echo "Showing pending posts:" && list_pending
+ if [ "$silent" != true ]; then
+  read -rp "Publish pending posts? (y/n):" "publish"
+  [ "$publish" != "y" ] && echo "Aborting publishing. Exiting." && exit 0 || echo -e "Publishing pending posts:\n(Notice: If more posts are added during this process, they will be published as well)"
+ fi
+ publish_pending
+ echo "Done."
+elif [ ! -z "delpub" ]; then
+ dupes=$(check_dupes publish)
+ if [ -z "$dupes" ]; then
+  echo "No duplicates found. Skipping duplicated published posts deletion. Exiting."
+ else
+  echo "Showing duplicated published posts:" && check_dupes publish
+  if [ "$silent" != true ]; then
+   read -rp "Are you sure you want to delete the duplicated published posts? (y/n):" "delpub"
+   [ "$delpub" != "y" ] && echo "Aborting deletion of the duplicated published posts. Exiting." && exit 0 || echo "Deleting duplicated published posts..."
+  fi
+  [ "$simulate" = true ] && echo "Duplication deletion skipped because of simulation mode." || delete_dupes publish
+  echo "Done."
+ fi
+else
+ echo "Wrong syntax. Required parameter: --show or --commit or --delpub."
+fi
