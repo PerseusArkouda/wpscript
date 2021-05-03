@@ -2,26 +2,34 @@
 # by Perseus
 # wp cli program for deleting duplicated Wordpress pending posts and then publishing them
 # NOTICE: Take a database backup of your Wordpress before you use it!!!
-# To automate enable silent mode and put in crontab like that (every 6 hours): * */6 * * * /path/to/wp-script --commit >/dev/null 2>/path/to/wp-script-errors.log
-#  When running automated and if you have a lot of pending posts, set it in longer time intervals in crontab to avoid being executed multiple times and cause unexpected results
+# To automate enable silent mode and put in crontab like that (every 6 hours): 0 */6 * * * /path/to/wp-script --commit >/dev/null 2>/path/to/wp-script-errors.log
+#  If you set too short intervals in crontab wp-script will automatically delay the new execution if the previous has not finished yet, until it does.
 # Parameter explanation:
 #  --show     Shows the pending posts and the duplicated pending posts (if they exist)
 #  --commit   Deletes duplicated pending posts, replaces specified strings (optional) and publishes them in time intervals
 #  --delpub   Deletes duplicated published posts
+
+# Changelog:
+# - Added check to know if wp-script is already running to prevent any possible conflict by being executed multiple times. Can be bypassed manually.
+# - Added minimum_time variable to set the minimum time threshold when random_time is set to true.
+# - Changed the way it publishes. Now it won't publish any extra pending posts added while it's commiting.
+# - Minor optimization fixes.
 
 
 # --- EDIT BELOW ---
 # Set the path of wp cli program
 wp_path="/usr/local/bin/wp"
 # Set the path of a wordpress site
-wordpress_path="/path/to/wordpress"
+wordpress_path="/path/to/your/wordpress"
 # Simulation mode. Pretends it deletes duplicates, publishes or search and replacing (if enabled). Switch to false to actually perform the tasks.
 simulate=true
 # Set the interval time in minutes for publishing between posts to avoid spam
-publish_time=30
-# Set if you want the interval time to be fixed or with a random value from 1 to $publish_time
+publish_time=50
+# Set if you want the interval time to be fixed or with a random value from minimum time (below setting) to publish_time
 random_time=true
-# Set if you want to automate without asking for confirmation before publishing
+# If you have set random_time to true then set here the minimum time threshold in minutes
+minimum_time=10
+# Set to true if you want to automate without asking for confirmations (i.e before publishing)
 silent=false
 
 # Advanced Settings
@@ -33,7 +41,8 @@ declare -A replace
 # array  search  replace
 replace["&apos;"]="'"
 replace["&amp;"]="&"
-
+replace["&#039;"]="'"
+replace["&quest;"]="?"
 
 # --- DO NOT EDIT BELOW ---
 
@@ -43,8 +52,11 @@ replace["&amp;"]="&"
 [ "$random_time" = true ] && [ -z "$(which shuf)" ] && echo "Error. shuf program not found and is required for random time. Set random_time to false or install shuf and retry." && exit 1
 [ -z "$1" ] && echo "Required parameter: --show or --commit or --delpub." && exit 1
 
-# Activating simulation mode
+# Activating and announcing simulation mode
 [ "$simulate" = true ] && echo "Running in Simulation mode." && dry="--dry-run"
+
+# Announcing silent mode
+[ "$silent" = true ] && echo "Silent mode is ON."
 
 # Function that shows pending duplicated posts
 check_dupes() {
@@ -96,25 +108,23 @@ delete_dupes() {
 
 # Function that lists pending posts
 list_pending() {
- "$wp_path" --path="$wordpress_path" post list --post_status=pending --post_type=post
+ [ ! -z "$1" ] && ids="--format=ids"
+ "$wp_path" --path="$wordpress_path" post list --post_status=pending --post_type=post $ids
  [ "$?" != "0" ] && echo "Error. wp returned an unknown error. Exiting immediately." && exit 1
 }
 
 # Function that publishes pending posts. This function also calls delete_dupes()
 publish_pending() {
- post_ids=( $("$wp_path" --path="$wordpress_path" post list --post_status=pending --post_type=post --format=ids) )
  count=0
- for post_id in "${post_ids[@]}"; do
+ pending_ids=($(list_pending ids))
+ for post_id in "${pending_ids[@]}"; do
   let count=count+1
-  if [ $count -ne 1 ]; then
-   if [ "$random_time" = true ]; then
-     timer=$(shuf -i1-${publish_time} -n1)
-     echo "Will publish the next post in $timer minutes..."
-     sleep ${timer}m
-   else
-     sleep ${publish_time}m
-   fi
+  if [ "$random_time" = true ]; then
+   timer=$(shuf -i${minimum_time}-${publish_time} -n1)
+  else
+   timer=$publish_time
   fi
+  [ $count -ne 1 ] && echo "Will publish the next post in $timer minutes..." && sleep ${timer}m
   dupes=$(check_dupes pending)
   if [ -z "$dupes" ]; then
    echo "No duplicates found. Skipping duplicated pending posts deletion."
@@ -126,7 +136,8 @@ publish_pending() {
    [ "$simulate" = true ] && echo "Duplication deletion skipped because of simulation mode." || delete_dupes pending
    echo "Done."
   fi
-  [ "$simulate" = true ] && echo "Publishing pending posts skipped because of simulation mode." || "$wp_path" --path="$wordpress_path" post update $post_id --post_status=publish
+  [ "$simulate" = true ] && echo -e "Publishing pending posts skipped because of simulation mode.\nPost ID $post_id would normally be posted." ||
+   "$wp_path" --path="$wordpress_path" post update $post_id --post_status=publish
   [ "$?" != "0" ] && echo "Error. wp returned an unknown error. Exiting immediately." && exit 1
  done
 }
@@ -141,6 +152,29 @@ search_and_replace() {
  echo "Done."
 }
 
+
+# Function to prevent running if already running
+check_run() {
+ while true; do
+  #chk=$(ps ax | grep $0 | grep -v $$ | grep bash | grep -v grep | grep -v "\./" 2>/dev/null)
+  #[ -z "$chk" ] && break
+  [ ! -f ".wp-script.lock" ] && break
+  echo "wp-script found already running or not finished previously properly."
+  echo "To clear previously created pseudo pid to pass this check type: rm .wp-script.lock"
+  if [ "$silent" = false ]; then
+   read -rp "Do you want to run it again anyway? (y/n):" "rerun"
+  fi
+  [ "$rerun" = "y" ] && break
+  echo "Entering auto wait loop with 1 minute intervals..."
+  sleep 1m
+ done
+}
+
+# Create/Remove pseudo pid
+pseudo_pid() {
+ [ "$1" = "create" ] && touch .wp-script.lock
+ [ "$1" = "remove" ] && rm .wp-script.lock
+}
 
 # Get the parameter and execute the appropriate task
 show=$(grep "^\-\-show" <<<"$1")
@@ -157,8 +191,10 @@ if [ ! -z "$show" ]; then
   echo "Done."
  fi
 elif [ ! -z "$commit" ]; then
+ check_run
+ pseudo_pid create
  echo "Checking for pending posts..."
- pending=$(list_pending)
+ pending=$(list_pending ids)
  if [ -z "$pending" ]; then
   echo "No pending posts. Nothing to commit." && exit 0
  fi
@@ -166,11 +202,13 @@ elif [ ! -z "$commit" ]; then
  echo "Showing pending posts:" && list_pending
  if [ "$silent" != true ]; then
   read -rp "Publish pending posts? (y/n):" "publish"
-  [ "$publish" != "y" ] && echo "Aborting publishing. Exiting." && exit 0 || echo -e "Publishing pending posts:\n(Notice: If more posts are added during this process, they will be published as well)"
+  [ "$publish" != "y" ] && echo "Aborting publishing. Exiting." && exit 0 || echo "Publishing pending posts:"
  fi
  publish_pending
  echo "Done."
 elif [ ! -z "delpub" ]; then
+ check_run
+ pseudo_pid create
  dupes=$(check_dupes publish)
  if [ -z "$dupes" ]; then
   echo "No duplicates found. Skipping duplicated published posts deletion. Exiting."
@@ -186,3 +224,5 @@ elif [ ! -z "delpub" ]; then
 else
  echo "Wrong syntax. Required parameter: --show or --commit or --delpub."
 fi
+
+pseudo_pid remove
