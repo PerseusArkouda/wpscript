@@ -21,7 +21,7 @@
 # Set the path of wp cli program
 wp_path="/usr/local/bin/wp"
 # Set the path of a wordpress site
-wordpress_path="/home/arkouda2/public_html/wordpress"
+wordpress_path="/path/to/your/wordpress"
 # Simulation mode. Pretends it deletes duplicates, publishes or search and replacing (if enabled). Switch to false to actually perform the tasks.
 simulate=false
 # Set the interval time in minutes for publishing between posts to avoid spam
