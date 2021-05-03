@@ -23,7 +23,7 @@ wp_path="/usr/local/bin/wp"
 # Set the path of a wordpress site
 wordpress_path="/path/to/your/wordpress"
 # Simulation mode. Pretends it deletes duplicates, publishes or search and replacing (if enabled). Switch to false to actually perform the tasks.
-simulate=false
+simulate=true
 # Set the interval time in minutes for publishing between posts to avoid spam
 publish_time=50
 # Set if you want the interval time to be fixed or with a random value from minimum time (below setting) to publish_time
@@ -31,12 +31,12 @@ random_time=true
 # If you have set random_time to true then set here the minimum time threshold in minutes. publish_time must be always higher than this
 minimum_time=10
 # Set to true if you want to automate without asking for confirmations (i.e before publishing)
-silent=true
+silent=false
 
 # Advanced Settings
 # Search and Replace functionality. It will replace strings from wp_posts, wp_postmeta and wp_terms tables
 # Enable it if you want and edit/add search and replace strings.
-search_replace=true
+search_replace=false
 declare -A replace
 # You can add as many strings you wish to search and replace in the array below with the following format:
 # array  search  replace
