@@ -14,28 +14,29 @@
 # - Added minimum_time variable to set the minimum time threshold when random_time is set to true.
 # - Changed the way it publishes. Now it won't publish any extra pending posts added while it's commiting.
 # - Minor optimization fixes.
+# - Same day update with further optimization and some minor bug fixes.
 
 
 # --- EDIT BELOW ---
 # Set the path of wp cli program
 wp_path="/usr/local/bin/wp"
 # Set the path of a wordpress site
-wordpress_path="/path/to/your/wordpress"
+wordpress_path="/home/arkouda2/public_html/wordpress"
 # Simulation mode. Pretends it deletes duplicates, publishes or search and replacing (if enabled). Switch to false to actually perform the tasks.
-simulate=true
+simulate=false
 # Set the interval time in minutes for publishing between posts to avoid spam
 publish_time=50
 # Set if you want the interval time to be fixed or with a random value from minimum time (below setting) to publish_time
 random_time=true
-# If you have set random_time to true then set here the minimum time threshold in minutes
+# If you have set random_time to true then set here the minimum time threshold in minutes. publish_time must be always higher than this
 minimum_time=10
 # Set to true if you want to automate without asking for confirmations (i.e before publishing)
-silent=false
+silent=true
 
 # Advanced Settings
 # Search and Replace functionality. It will replace strings from wp_posts, wp_postmeta and wp_terms tables
 # Enable it if you want and edit/add search and replace strings.
-search_replace=false
+search_replace=true
 declare -A replace
 # You can add as many strings you wish to search and replace in the array below with the following format:
 # array  search  replace
@@ -58,12 +59,43 @@ replace["&quest;"]="?"
 # Announcing silent mode
 [ "$silent" = true ] && echo "Silent mode is ON."
 
-# Function that shows pending duplicated posts
-check_dupes() {
+# Function that deletes pending or published duplicated posts
+delete_duplicates() {
+ echo
  status="$1"
- if [ "$status" != "pending" ] && [ "$status" != "publish" ]; then
-  echo "Error. status variable is not defined correctly. Exiting." && exit 1
+ [ "$status" = "published" ] && status="publish"
+ if [ "$silent" != true ]; then
+  read -rp "Are you sure you want to delete the duplicated $post_status posts? (y/n):" "del_dupes"
+  [ "$del_dupes" != "y" ] && echo "Aborting deletion of the duplicated $post_status posts. Exiting." && exit 0
  fi
+ if [ "$simulate" = true ]; then
+  echo "Duplication deletion skipped because of simulation mode."
+ else
+  "$wp_path" --path="$wordpress_path" db query "
+   DELETE a.*
+    FROM wp_posts AS a
+      INNER JOIN (
+         SELECT post_title, MIN( id ) AS min_id
+         FROM wp_posts
+         WHERE post_type = 'post'
+         AND post_status = '$status'
+         GROUP BY post_title
+         HAVING COUNT( * ) > 1
+      ) AS b ON b.post_title = a.post_title
+    AND b.min_id <> a.id
+    AND a.post_type = 'post'
+    AND a.post_status = '$status'
+  "
+  [ "$?" != "0" ] && echo "Error. wp returned an unknown error. Exiting immediately." && exit 1
+  echo "Done."
+ fi
+}
+
+# Function that shows pending or published duplicated posts
+show_duplicates() {
+ echo
+ status="$1"
+ [ "$status" = "published" ] && status="publish"
  "$wp_path" --path="$wordpress_path" db query "
   SELECT a.ID, a.post_title, a.post_type, a.post_status
    FROM wp_posts AS a
@@ -82,39 +114,46 @@ check_dupes() {
  [ "$?" != "0" ] && echo "Error. wp returned an unknown error. Exiting immediately." && exit 1
 }
 
-# Function that deletes pending duplicated posts
-delete_dupes() {
- status="$1"
- if [ "$status" != "pending" ] && [ "$status" != "publish" ]; then
-  echo "Error. status variable is not defined correctly. Exiting." && exit 1
+# Function for duplicates precheck. Calls delete_duplicates()
+check_duplicates() {
+ echo
+ post_status="$1"
+ dupes_action="$2"
+ if [ "$post_status" != "pending" ] && [ "$post_status" != "published" ]; then
+  echo "Error. post_status variable is not defined correctly. Exiting." && exit 1
  fi
- "$wp_path" --path="$wordpress_path" db query "
-  DELETE a.*
-   FROM wp_posts AS a
-     INNER JOIN (
-        SELECT post_title, MIN( id ) AS min_id
-        FROM wp_posts
-        WHERE post_type = 'post'
-        AND post_status = '$status'
-        GROUP BY post_title
-        HAVING COUNT( * ) > 1
-     ) AS b ON b.post_title = a.post_title
-   AND b.min_id <> a.id
-   AND a.post_type = 'post'
-   AND a.post_status = '$status'
- "
- [ "$?" != "0" ] && echo "Error. wp returned an unknown error. Exiting immediately." && exit 1
+ dupes=$(show_duplicates "$post_status")
+ if [ -z "$dupes" ]; then
+  echo "No duplicated $post_status posts found. OK!"
+ else
+  echo "Showing duplicated $post_status posts:" && show_duplicates "$post_status"
+  [ "$dupes_action" = "commit" ] && echo "Deleting duplicated $post_status posts..." && delete_duplicates "$post_status"
+ fi
 }
 
 # Function that lists pending posts
 list_pending() {
- [ ! -z "$1" ] && ids="--format=ids"
+ [ -z "$1" ] && echo && echo "Showing pending posts:" || ids="--format=ids"
  "$wp_path" --path="$wordpress_path" post list --post_status=pending --post_type=post $ids
  [ "$?" != "0" ] && echo "Error. wp returned an unknown error. Exiting immediately." && exit 1
 }
 
-# Function that publishes pending posts. This function also calls delete_dupes()
+# Function checks if there are pending posts
+check_pending() {
+ echo
+ echo "Checking for pending posts..."
+ pending=$(list_pending ids)
+ [ -z "$pending" ] && echo "No pending posts." && exit 0
+}
+
+# Function that publishes pending posts
 publish_pending() {
+ echo
+ if [ "$silent" != true ]; then
+  read -rp "Publish pending posts? (y/n):" "publish"
+  echo
+  [ "$publish" != "y" ] && echo "Aborting publishing. Exiting." && exit 0 || echo "Publishing pending posts:"
+ fi
  count=0
  pending_ids=($(list_pending ids))
  for post_id in "${pending_ids[@]}"; do
@@ -124,26 +163,17 @@ publish_pending() {
   else
    timer=$publish_time
   fi
-  [ $count -ne 1 ] && echo "Will publish the next post in $timer minutes..." && sleep ${timer}m
-  dupes=$(check_dupes pending)
-  if [ -z "$dupes" ]; then
-   echo "No duplicates found. Skipping duplicated pending posts deletion."
-  else
-   if [ "$silent" != true ]; then
-    read -rp "Are you sure you want to delete the duplicated pending posts? (y/n):" "delpen"
-    [ "$delpen" != "y" ] && echo "Aborting deletion of the duplicated pending posts. Exiting." && exit 0 || echo "Duplicates found. Deleting duplicated pending posts..."
-   fi
-   [ "$simulate" = true ] && echo "Duplication deletion skipped because of simulation mode." || delete_dupes pending
-   echo "Done."
-  fi
-  [ "$simulate" = true ] && echo -e "Publishing pending posts skipped because of simulation mode.\nPost ID $post_id would normally be posted." ||
+  [ $count -ne 1 ] && echo "Will publish the next one in $timer minutes..." && sleep ${timer}m
+  [ "$simulate" = true ] && echo -e "Publishing pending posts skipped because of simulation mode.\nPost ID $post_id would have normally be posted." ||
    "$wp_path" --path="$wordpress_path" post update $post_id --post_status=publish
   [ "$?" != "0" ] && echo "Error. wp returned an unknown error. Exiting immediately." && exit 1
  done
+ echo "Done."
 }
 
-# Function to search and replace strings
+# Function to search and replace strings in database
 search_and_replace() {
+ echo
  for i in "${!replace[@]}"; do
   echo "Searching for: $i and replacing with: ${replace[$i]}..."
   "$wp_path" --path="$wordpress_path" search-replace "$i" "${replace[$i]}" wp_posts wp_postmeta wp_terms $dry
@@ -152,12 +182,10 @@ search_and_replace() {
  echo "Done."
 }
 
-
-# Function to prevent running if already running
+# Function to prevent script from running again if already running
 check_run() {
+ echo
  while true; do
-  #chk=$(ps ax | grep $0 | grep -v $$ | grep bash | grep -v grep | grep -v "\./" 2>/dev/null)
-  #[ -z "$chk" ] && break
   [ ! -f ".wp-script.lock" ] && break
   echo "wp-script found already running or not finished previously properly."
   echo "To clear previously created pseudo pid to pass this check type: rm .wp-script.lock"
@@ -170,59 +198,36 @@ check_run() {
  done
 }
 
-# Create/Remove pseudo pid
+# Function to create/remove pseudo pid
 pseudo_pid() {
- [ "$1" = "create" ] && touch .wp-script.lock
- [ "$1" = "remove" ] && rm .wp-script.lock
+ [ "$1" = "create" ] && [ ! -f ".wp-script.lock" ] && touch .wp-script.lock
+ [ "$1" = "remove" ] && [ -f ".wp-script.lock" ] && rm .wp-script.lock
 }
 
-# Get the parameter and execute the appropriate task
+# Gets the parameter and executes the appropriate task
 show=$(grep "^\-\-show" <<<"$1")
 commit=$(grep "^\-\-commit" <<<"$1")
 delpub=$(grep "^\-\-delpub" <<<"$1")
 
 if [ ! -z "$show" ]; then
- echo "Showing pending posts:" && list_pending
- dupes=$(check_dupes pending)
- if [ -z "$dupes" ]; then
-  echo "No duplicated pending posts found. Ok!"
- else
-  echo "Showing duplicated pending posts:" && check_dupes pending
-  echo "Done."
- fi
+ check_pending
+ list_pending
+ check_duplicates pending show
 elif [ ! -z "$commit" ]; then
  check_run
  pseudo_pid create
- echo "Checking for pending posts..."
- pending=$(list_pending ids)
- if [ -z "$pending" ]; then
-  echo "No pending posts. Nothing to commit." && exit 0
- fi
+ check_pending
  [ "$search_replace" = true ] && search_and_replace
- echo "Showing pending posts:" && list_pending
- if [ "$silent" != true ]; then
-  read -rp "Publish pending posts? (y/n):" "publish"
-  [ "$publish" != "y" ] && echo "Aborting publishing. Exiting." && exit 0 || echo "Publishing pending posts:"
- fi
+ check_duplicates pending commit
+ list_pending
  publish_pending
- echo "Done."
-elif [ ! -z "delpub" ]; then
+elif [ ! -z "$delpub" ]; then
  check_run
  pseudo_pid create
- dupes=$(check_dupes publish)
- if [ -z "$dupes" ]; then
-  echo "No duplicates found. Skipping duplicated published posts deletion. Exiting."
- else
-  echo "Showing duplicated published posts:" && check_dupes publish
-  if [ "$silent" != true ]; then
-   read -rp "Are you sure you want to delete the duplicated published posts? (y/n):" "delpub"
-   [ "$delpub" != "y" ] && echo "Aborting deletion of the duplicated published posts. Exiting." && exit 0 || echo "Deleting duplicated published posts..."
-  fi
-  [ "$simulate" = true ] && echo "Duplication deletion skipped because of simulation mode." || delete_dupes publish
-  echo "Done."
- fi
+ check_duplicates published commit
 else
  echo "Wrong syntax. Required parameter: --show or --commit or --delpub."
 fi
 
+# Removes pseudo pid at exit
 pseudo_pid remove
